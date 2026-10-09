@@ -1,6 +1,6 @@
 flask
-pytubefix
-supabase
 python-dotenv
+supabase
 requests
 gunicorn
+yt-dlp[default]
