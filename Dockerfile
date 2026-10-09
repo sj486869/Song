@@ -1,19 +1,20 @@
-# 1. Update to Python 3.11
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# 2. Install FFmpeg AND Git (git is needed to download yt-dlp from github)
-RUN apt-get update && apt-get install -y ffmpeg git
+# ffmpeg: fallback for formats that need merging/conversion
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# 3. Set Working Directory
+# Deno: JavaScript runtime that recent yt-dlp versions use for YouTube
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
-# 4. Copy Files
+COPY requirements.txt .
+# -U pulls the newest yt-dlp every time the image is rebuilt
+RUN pip install --no-cache-dir -U -r requirements.txt
+
 COPY . .
 
-# 5. Install Libraries
-RUN pip install --no-cache-dir -r requirements.txt
-
-EXPOSE 5000
-
-# 6. Run Gunicorn with a 120-second timeout
-CMD ["gunicorn", "--timeout", "120", "-b", "0.0.0.0:5000", "app:app"]
+# Render sets $PORT (default 10000). Long timeout because downloads happen inside the request.
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 4 --timeout 300
