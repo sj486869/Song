@@ -46,12 +46,6 @@ if os.path.exists(COOKIES_SRC):
 
 
 def build_ydl_opts(timestamp, player_client="ios", use_cookies=False):
-    """Build yt-dlp options.
-
-    Strategy:
-      1. ios client  – works from datacenters, no cookies needed
-      2. web client  + cookies – fallback if ios stops working
-    """
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s"),
@@ -79,7 +73,6 @@ def index():
     return render_template("index.html")
 
 
-# ── Debug endpoint ────────────────────────────────────────────
 @app.route("/api/debug")
 def debug_info():
     cookies_exist = os.path.exists(COOKIES_SRC)
@@ -96,7 +89,6 @@ def debug_info():
         "cookie_count": cookie_count,
         "proxy": PROXY or "not set",
     })
-# ──────────────────────────────────────────────────────────────
 
 
 @app.route("/api/songs", methods=["GET"])
@@ -115,7 +107,7 @@ def add_song():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok$)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     timestamp = int(time.time() * 1000)
 
     try:
@@ -147,7 +139,7 @@ def add_song():
                         ), 400
                     info = ydl.process_ie_result(info, download=True)
                 print(f"Success with: {strat['label']}")
-                break  # worked!
+                break
             except Exception as e:
                 last_error = e
                 print(f"Failed with {strat['label']}: {e}")
