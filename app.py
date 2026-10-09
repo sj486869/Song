@@ -1,10 +1,10 @@
 import os
 import time
 import requests
-import yt_dlp
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from pytubefix import YouTube # yt-dlp ki jagah pytubefix use kar rahe hain
 
 load_dotenv()
 
@@ -38,33 +38,30 @@ def add_song():
 
     os.makedirs("temp_downloads", exist_ok=True)
     timestamp = int(time.time() * 1000)
-    temp_prefix = f"temp_downloads/{timestamp}"
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f"{temp_prefix}.%(ext)s",
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        'quiet': True,
-        'no_warnings': True,
-    }
+    
+    mp3_path = None
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Unknown Title")
-            artist = info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist"
-            thumb_url = info.get("thumbnail", "")
-            mp3_path = f"{temp_prefix}.mp3"
+        # Pytubefix se YouTube video fetch karna
+        yt = YouTube(url)
+        title = yt.title
+        artist = yt.author
+        thumb_url = yt.thumbnail_url
+        
+        # Best audio quality nikalna
+        audio_stream = yt.streams.get_audio_only()
+        # .m4a format mein download karna
+        mp3_path = audio_stream.download(output_path="temp_downloads", filename=f"{timestamp}.m4a")
             
-        # Upload MP3
-        audio_storage_path = f"songs/{timestamp}.mp3"
+        # Upload Audio to Supabase
+        audio_storage_path = f"songs/{timestamp}.m4a"
         with open(mp3_path, "rb") as f:
             supabase.storage.from_(BUCKET_NAME).upload(
-                path=audio_storage_path, file=f.read(), file_options={"content-type": "audio/mpeg", "upsert": "true"}
+                path=audio_storage_path, file=f.read(), file_options={"content-type": "audio/mp4", "upsert": "true"}
             )
         audio_public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(audio_storage_path)
 
-        # Upload Cover Art
+        # Upload Cover Art to Supabase
         cover_public_url = ""
         cover_storage_path = f"covers/{timestamp}.jpg"
         if thumb_url:
@@ -85,7 +82,8 @@ def add_song():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        if 'mp3_path' in locals() and os.path.exists(mp3_path):
+        # Clean up temp file
+        if mp3_path and os.path.exists(mp3_path):
             os.remove(mp3_path)
 
 @app.route("/api/songs/<int:song_id>", methods=["DELETE"])
