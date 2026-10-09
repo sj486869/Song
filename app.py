@@ -2,6 +2,7 @@ import glob
 import os
 import shutil
 import time
+import subprocess
 
 import requests
 import yt_dlp
@@ -19,7 +20,7 @@ BUCKET_NAME = "songs"
 TABLE_NAME = "songs"
 
 COOKIES_SRC = os.getenv("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
-PROXY = os.getenv("YT_PROXY")
+PROXY = os.getenv("YT_PROXY")  # e.g. http://user:pass@host:port
 MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
 DOWNLOAD_DIR = "temp_downloads"
 
@@ -42,10 +43,17 @@ if os.path.exists(COOKIES_SRC):
     with open(COOKIES_SRC) as f:
         lines = [l for l in f.read().splitlines() if l and not l.startswith("#")]
         print(f"Cookies loaded : {len(lines)} entries")
+print(f"Proxy          : {PROXY or 'not set'}")
+# Check Deno
+try:
+    result = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
+    print(f"Deno           : {result.stdout.strip()}")
+except Exception as e:
+    print(f"Deno           : NOT FOUND ({e})")
 # ──────────────────────────────────────────────────────────────
 
 
-def build_ydl_opts(timestamp, player_client="ios", use_cookies=False):
+def build_ydl_opts(timestamp, player_client=None, use_cookies=False):
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s"),
@@ -54,17 +62,15 @@ def build_ydl_opts(timestamp, player_client="ios", use_cookies=False):
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 3,
-        "extractor_args": {"youtube": {"player_client": [player_client]}},
     }
+    if player_client:
+        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
     if PROXY:
         opts["proxy"] = PROXY
     if use_cookies and os.path.exists(COOKIES_SRC):
         cookie_copy = os.path.join(DOWNLOAD_DIR, f"{timestamp}_cookies.txt")
         shutil.copy(COOKIES_SRC, cookie_copy)
         opts["cookiefile"] = cookie_copy
-        print(f"[{player_client}] Using cookies")
-    else:
-        print(f"[{player_client}] No cookies")
     return opts
 
 
@@ -73,6 +79,7 @@ def index():
     return render_template("index.html")
 
 
+# ── Debug endpoint ────────────────────────────────────────────
 @app.route("/api/debug")
 def debug_info():
     cookies_exist = os.path.exists(COOKIES_SRC)
@@ -82,13 +89,88 @@ def debug_info():
             cookie_count = len(
                 [l for l in f.read().splitlines() if l and not l.startswith("#")]
             )
+    deno_version = "not found"
+    try:
+        result = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
+        deno_version = result.stdout.strip()
+    except Exception:
+        pass
     return jsonify({
         "yt_dlp_version": yt_dlp.version.__version__,
         "cookies_file": COOKIES_SRC,
         "cookies_exist": cookies_exist,
         "cookie_count": cookie_count,
         "proxy": PROXY or "not set",
+        "deno": deno_version,
     })
+
+
+# ── Verbose test endpoint ────────────────────────────────────
+@app.route("/api/test")
+def test_download():
+    """Run yt-dlp with verbose output to see exactly what's failing."""
+    url = request.args.get("url", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    timestamp = int(time.time() * 1000)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    results = []
+
+    # Test 1: no extractor_args (yt-dlp defaults)
+    # Test 2: ios client
+    # Test 3: web + cookies
+    tests = [
+        {"label": "default (no player_client)", "player_client": None, "use_cookies": False},
+        {"label": "ios", "player_client": "ios", "use_cookies": False},
+        {"label": "web + cookies", "player_client": "web", "use_cookies": True},
+    ]
+
+    for test in tests:
+        opts = build_ydl_opts(
+            timestamp,
+            player_client=test["player_client"],
+            use_cookies=test["use_cookies"],
+        )
+        opts["verbose"] = True
+        # Capture verbose output
+        logs = []
+        opts["logger"] = type("Logger", (), {
+            "debug": lambda self, msg: logs.append(msg),
+            "warning": lambda self, msg: logs.append(msg),
+            "error": lambda self, msg: logs.append(msg),
+        })()
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            results.append({
+                "strategy": test["label"],
+                "status": "SUCCESS",
+                "title": info.get("title"),
+                "duration": info.get("duration"),
+            })
+        except Exception as e:
+            results.append({
+                "strategy": test["label"],
+                "status": "FAILED",
+                "error": str(e)[:500],
+                "logs": logs[-20:],  # last 20 log lines
+            })
+
+    # Cleanup
+    for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}*")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return jsonify({
+        "url": url,
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "proxy": PROXY or "not set",
+        "cookies_found": os.path.exists(COOKIES_SRC),
+        "results": results,
+    })
+# ──────────────────────────────────────────────────────────────
 
 
 @app.route("/api/songs", methods=["GET"])
@@ -111,15 +193,15 @@ def add_song():
     timestamp = int(time.time() * 1000)
 
     try:
-        # ── Try multiple strategies ───────────────────────────
         info = None
         last_error = None
 
         strategies = [
-            {"player_client": "ios",  "use_cookies": False, "label": "ios (no cookies)"},
-            {"player_client": "tv",   "use_cookies": False, "label": "tv (no cookies)"},
-            {"player_client": "web",  "use_cookies": True,  "label": "web + cookies"},
-            {"player_client": "mweb", "use_cookies": False, "label": "mweb (no cookies)"},
+            {"player_client": None,  "use_cookies": False, "label": "default"},
+            {"player_client": "ios", "use_cookies": False, "label": "ios"},
+            {"player_client": "tv",  "use_cookies": False, "label": "tv"},
+            {"player_client": "web", "use_cookies": True,  "label": "web+cookies"},
+            {"player_client": "mweb","use_cookies": False, "label": "mweb"},
         ]
 
         for strat in strategies:
@@ -147,12 +229,13 @@ def add_song():
 
         if info is None:
             return jsonify({
-                "error": f"All download strategies failed. Last error: {last_error}",
+                "error": f"All strategies failed. Last: {last_error}",
                 "yt_dlp_version": yt_dlp.version.__version__,
                 "cookies_found": os.path.exists(COOKIES_SRC),
+                "proxy": PROXY or "not set",
+                "fix": "Set YT_PROXY env var to a residential proxy URL",
             }), 502
 
-        # ── Process result ────────────────────────────────────
         title = info.get("track") or info.get("title") or "Unknown title"
         artist = (
             info.get("artist")
@@ -162,7 +245,6 @@ def add_song():
         )
         thumb_url = info.get("thumbnail")
 
-        # Locate the downloaded file
         downloads = info.get("requested_downloads") or []
         file_path = downloads[0].get("filepath") if downloads else None
         if not file_path or not os.path.exists(file_path):
@@ -178,7 +260,6 @@ def add_song():
         ext = os.path.splitext(file_path)[1].lstrip(".").lower() or "m4a"
         content_type = CONTENT_TYPES.get(ext, "application/octet-stream")
 
-        # 1. Upload audio to Supabase
         audio_storage_path = f"songs/{timestamp}.{ext}"
         with open(file_path, "rb") as f:
             supabase.storage.from_(BUCKET_NAME).upload(
@@ -190,7 +271,6 @@ def add_song():
             audio_storage_path
         )
 
-        # 2. Upload cover art to Supabase
         cover_public_url = ""
         if thumb_url:
             try:
@@ -208,7 +288,6 @@ def add_song():
             except requests.RequestException:
                 pass
 
-        # 3. Insert database record
         supabase.table(TABLE_NAME).insert(
             {
                 "title": title,
