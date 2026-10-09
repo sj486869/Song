@@ -3,3 +3,4 @@ python-dotenv
 supabase
 requests
 gunicorn
+curl_cffi
