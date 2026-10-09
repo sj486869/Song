@@ -4,4 +4,4 @@ supabase
 requests
 gunicorn
 curl_cffi
-pysocks
+PySocks
