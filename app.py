@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 import subprocess
+import json
 
 import requests
 import yt_dlp
@@ -20,7 +21,7 @@ BUCKET_NAME = "songs"
 TABLE_NAME = "songs"
 
 COOKIES_SRC = os.getenv("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
-PROXY = os.getenv("YT_PROXY")  # e.g. http://user:pass@host:port
+PROXY = os.getenv("YT_PROXY")
 MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
 DOWNLOAD_DIR = "temp_downloads"
 
@@ -37,41 +38,94 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Startup info ──────────────────────────────────────────────
 print(f"yt-dlp version : {yt_dlp.version.__version__}")
-print(f"Cookies file   : {COOKIES_SRC}")
-print(f"Cookies exist  : {os.path.exists(COOKIES_SRC)}")
-if os.path.exists(COOKIES_SRC):
-    with open(COOKIES_SRC) as f:
-        lines = [l for l in f.read().splitlines() if l and not l.startswith("#")]
-        print(f"Cookies loaded : {len(lines)} entries")
+print(f"Cookies file   : {COOKIES_SRC} → exists={os.path.exists(COOKIES_SRC)}")
 print(f"Proxy          : {PROXY or 'not set'}")
-# Check Deno
 try:
-    result = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
-    print(f"Deno           : {result.stdout.strip()}")
-except Exception as e:
-    print(f"Deno           : NOT FOUND ({e})")
+    r = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
+    print(f"Deno           : {r.stdout.strip()}")
+except Exception:
+    print(f"Deno           : not found")
 # ──────────────────────────────────────────────────────────────
 
 
-def build_ydl_opts(timestamp, player_client=None, use_cookies=False):
-    opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 3,
-    }
-    if player_client:
-        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+def download_with_subprocess(url, timestamp):
+    """Run yt-dlp as a subprocess. curl handles proxy auth correctly."""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    outtmpl = os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--format", "bestaudio[ext=m4a]/bestaudio/best",
+        "--outtmpl", outtmpl,
+        "--noplaylist",
+        "--socket-timeout", "30",
+        "--retries", "3",
+        "--dump-json",
+        "--no-download",  # first pass: metadata only
+    ]
+
     if PROXY:
-        opts["proxy"] = PROXY
-    if use_cookies and os.path.exists(COOKIES_SRC):
+        cmd += ["--proxy", PROXY]
+    if os.path.exists(COOKIES_SRC):
         cookie_copy = os.path.join(DOWNLOAD_DIR, f"{timestamp}_cookies.txt")
         shutil.copy(COOKIES_SRC, cookie_copy)
-        opts["cookiefile"] = cookie_copy
-    return opts
+        cmd += ["--cookiefile", cookie_copy]
+
+    cmd.append(url)
+
+    print(f"Running: {' '.join(cmd[:8])}...")
+
+    # Pass 1: get metadata
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        # Try with different player clients
+        for client in ["ios", "tv", "mweb"]:
+            cmd_retry = cmd.copy()
+            cmd_retry.insert(1, "--extractor-args")
+            cmd_retry.insert(2, f"youtube:player_client={client}")
+            print(f"Retrying with player_client={client}")
+            result = subprocess.run(cmd_retry, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                break
+
+        if result.returncode != 0:
+            raise Exception(f"yt-dlp metadata failed: {result.stderr[-500:]}")
+
+    info = json.loads(result.stdout)
+    duration = info.get("duration")
+    if duration and duration > MAX_DURATION:
+        raise Exception(f"Video too long (max {MAX_DURATION // 60} minutes)")
+
+    # Pass 2: download the audio
+    cmd_download = [
+        "yt-dlp",
+        "--format", "bestaudio[ext=m4a]/bestaudio/best",
+        "--outtmpl", outtmpl,
+        "--noplaylist",
+        "--socket-timeout", "30",
+        "--retries", "3",
+    ]
+    if PROXY:
+        cmd_download += ["--proxy", PROXY]
+    if os.path.exists(COOKIES_SRC):
+        cmd_download += ["--cookiefile", cookie_copy]
+
+    cmd_download.append(url)
+
+    result = subprocess.run(cmd_download, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise Exception(f"yt-dlp download failed: {result.stderr[-500:]}")
+
+    # Find the file
+    matches = [
+        p for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}.*"))
+        if not p.endswith(".part") and not p.endswith(".txt")
+    ]
+    if not matches:
+        raise Exception("Downloaded file not found")
+
+    info["filepath"] = matches[0]
+    return info
 
 
 @app.route("/")
@@ -79,7 +133,6 @@ def index():
     return render_template("index.html")
 
 
-# ── Debug endpoint ────────────────────────────────────────────
 @app.route("/api/debug")
 def debug_info():
     cookies_exist = os.path.exists(COOKIES_SRC)
@@ -89,88 +142,61 @@ def debug_info():
             cookie_count = len(
                 [l for l in f.read().splitlines() if l and not l.startswith("#")]
             )
-    deno_version = "not found"
+    deno_ver = "not found"
     try:
-        result = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
-        deno_version = result.stdout.strip()
+        r = subprocess.run(["deno", "--version"], capture_output=True, text=True, timeout=5)
+        deno_ver = r.stdout.strip()
     except Exception:
         pass
+    # Test proxy with curl
+    proxy_test = "not tested"
+    if PROXY:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "--proxy", PROXY, "--max-time", "10",
+                 "https://www.youtube.com/robots.txt"],
+                capture_output=True, text=True, timeout=15
+            )
+            proxy_test = f"HTTP {r.stdout.strip()} (curl)"
+        except Exception as e:
+            proxy_test = f"failed: {e}"
     return jsonify({
         "yt_dlp_version": yt_dlp.version.__version__,
-        "cookies_file": COOKIES_SRC,
         "cookies_exist": cookies_exist,
         "cookie_count": cookie_count,
         "proxy": PROXY or "not set",
-        "deno": deno_version,
+        "proxy_test": proxy_test,
+        "deno": deno_ver,
     })
 
 
-# ── Verbose test endpoint ────────────────────────────────────
 @app.route("/api/test")
 def test_download():
-    """Run yt-dlp with verbose output to see exactly what's failing."""
     url = request.args.get("url", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
     timestamp = int(time.time() * 1000)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    results = []
+    try:
+        info = download_with_subprocess(url, timestamp)
+        result = {
+            "status": "SUCCESS",
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+        }
+    except Exception as e:
+        result = {
+            "status": "FAILED",
+            "error": str(e),
+        }
+    finally:
+        for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}*")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
-    # Test 1: no extractor_args (yt-dlp defaults)
-    # Test 2: ios client
-    # Test 3: web + cookies
-    tests = [
-        {"label": "default (no player_client)", "player_client": None, "use_cookies": False},
-        {"label": "ios", "player_client": "ios", "use_cookies": False},
-        {"label": "web + cookies", "player_client": "web", "use_cookies": True},
-    ]
-
-    for test in tests:
-        opts = build_ydl_opts(
-            timestamp,
-            player_client=test["player_client"],
-            use_cookies=test["use_cookies"],
-        )
-        opts["verbose"] = True
-        # Capture verbose output
-        logs = []
-        opts["logger"] = type("Logger", (), {
-            "debug": lambda self, msg: logs.append(msg),
-            "warning": lambda self, msg: logs.append(msg),
-            "error": lambda self, msg: logs.append(msg),
-        })()
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            results.append({
-                "strategy": test["label"],
-                "status": "SUCCESS",
-                "title": info.get("title"),
-                "duration": info.get("duration"),
-            })
-        except Exception as e:
-            results.append({
-                "strategy": test["label"],
-                "status": "FAILED",
-                "error": str(e)[:500],
-                "logs": logs[-20:],  # last 20 log lines
-            })
-
-    # Cleanup
-    for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}*")):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-    return jsonify({
-        "url": url,
-        "yt_dlp_version": yt_dlp.version.__version__,
-        "proxy": PROXY or "not set",
-        "cookies_found": os.path.exists(COOKIES_SRC),
-        "results": results,
-    })
-# ──────────────────────────────────────────────────────────────
+    return jsonify(result)
 
 
 @app.route("/api/songs", methods=["GET"])
@@ -189,52 +215,10 @@ def add_song():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     timestamp = int(time.time() * 1000)
 
     try:
-        info = None
-        last_error = None
-
-        strategies = [
-            {"player_client": None,  "use_cookies": False, "label": "default"},
-            {"player_client": "ios", "use_cookies": False, "label": "ios"},
-            {"player_client": "tv",  "use_cookies": False, "label": "tv"},
-            {"player_client": "web", "use_cookies": True,  "label": "web+cookies"},
-            {"player_client": "mweb","use_cookies": False, "label": "mweb"},
-        ]
-
-        for strat in strategies:
-            print(f"Trying: {strat['label']}")
-            try:
-                opts = build_ydl_opts(
-                    timestamp,
-                    player_client=strat["player_client"],
-                    use_cookies=strat["use_cookies"],
-                )
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    duration = info.get("duration")
-                    if duration and duration > MAX_DURATION:
-                        return jsonify(
-                            {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
-                        ), 400
-                    info = ydl.process_ie_result(info, download=True)
-                print(f"Success with: {strat['label']}")
-                break
-            except Exception as e:
-                last_error = e
-                print(f"Failed with {strat['label']}: {e}")
-                continue
-
-        if info is None:
-            return jsonify({
-                "error": f"All strategies failed. Last: {last_error}",
-                "yt_dlp_version": yt_dlp.version.__version__,
-                "cookies_found": os.path.exists(COOKIES_SRC),
-                "proxy": PROXY or "not set",
-                "fix": "Set YT_PROXY env var to a residential proxy URL",
-            }), 502
+        info = download_with_subprocess(url, timestamp)
 
         title = info.get("track") or info.get("title") or "Unknown title"
         artist = (
@@ -245,21 +229,14 @@ def add_song():
         )
         thumb_url = info.get("thumbnail")
 
-        downloads = info.get("requested_downloads") or []
-        file_path = downloads[0].get("filepath") if downloads else None
+        file_path = info.get("filepath")
         if not file_path or not os.path.exists(file_path):
-            matches = [
-                p
-                for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}.*"))
-                if not p.endswith(".part")
-            ]
-            file_path = matches[0] if matches else None
-        if not file_path:
             return jsonify({"error": "Could not find audio for this video"}), 404
 
         ext = os.path.splitext(file_path)[1].lstrip(".").lower() or "m4a"
         content_type = CONTENT_TYPES.get(ext, "application/octet-stream")
 
+        # 1. Upload audio to Supabase
         audio_storage_path = f"songs/{timestamp}.{ext}"
         with open(file_path, "rb") as f:
             supabase.storage.from_(BUCKET_NAME).upload(
@@ -271,6 +248,7 @@ def add_song():
             audio_storage_path
         )
 
+        # 2. Upload cover art to Supabase
         cover_public_url = ""
         if thumb_url:
             try:
@@ -288,6 +266,7 @@ def add_song():
             except requests.RequestException:
                 pass
 
+        # 3. Insert database record
         supabase.table(TABLE_NAME).insert(
             {
                 "title": title,
