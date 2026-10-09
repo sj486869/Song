@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Song App Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-8">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-bold mb-8 text-center text-blue-400">🎵 Song App Manager</h1>
+
+        <!-- Add Song Form -->
+        <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-8">
+            <h2 class="text-xl font-semibold mb-4">Add New Song</h2>
+            <div class="flex gap-4">
+                <input type="text" id="youtubeUrl" placeholder="Paste YouTube Link here..." 
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:border-blue-500">
+                <button onclick="addSong()" id="addBtn" 
+                    class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded font-semibold transition-colors">
+                    Download & Upload
+                </button>
+            </div>
+            <p id="statusMsg" class="mt-4 text-sm text-gray-400 hidden">⏳ Processing... this may take a minute.</p>
+        </div>
+
+        <!-- Song List -->
+        <div class="bg-gray-800 p-6 rounded-lg shadow-lg">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-semibold">Your Library</h2>
+                <button onclick="loadSongs()" class="text-sm bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded">Refresh</button>
+            </div>
+            
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr class="border-b border-gray-700 text-gray-400">
+                            <th class="py-3 px-4">Cover</th>
+                            <th class="py-3 px-4">Title</th>
+                            <th class="py-3 px-4">Artist</th>
+                            <th class="py-3 px-4 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="songList">
+                        <!-- Songs injected here via JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function loadSongs() {
+            const tbody = document.getElementById('songList');
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center py-4">Loading songs...</td></tr>';
+            
+            const res = await fetch('/api/songs');
+            const songs = await res.json();
+            
+            tbody.innerHTML = '';
+            songs.forEach(song => {
+                const tr = document.createElement('tr');
+                tr.className = 'border-b border-gray-700/50 hover:bg-gray-750 transition-colors';
+                tr.innerHTML = `
+                    <td class="py-3 px-4">
+                        <img src="${song.coverUrl}" alt="Cover" class="w-12 h-12 object-cover rounded shadow">
+                    </td>
+                    <td class="py-3 px-4 font-medium">${song.title}</td>
+                    <td class="py-3 px-4 text-gray-400">${song.artist}</td>
+                    <td class="py-3 px-4 text-right">
+                        <button onclick="deleteSong(${song.id})" 
+                            class="text-red-400 hover:text-red-300 bg-red-400/10 hover:bg-red-400/20 px-3 py-1 rounded text-sm transition-colors">
+                            Delete
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function addSong() {
+            const urlInput = document.getElementById('youtubeUrl');
+            const btn = document.getElementById('addBtn');
+            const status = document.getElementById('statusMsg');
+            const url = urlInput.value.trim();
+
+            if (!url) return alert("Please enter a link!");
+
+            // Update UI state
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+            status.classList.remove('hidden');
+            status.textContent = "⏳ Downloading and uploading... please wait.";
+
+            try {
+                const res = await fetch('/api/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                
+                const data = await res.json();
+                if (data.error) throw new Error(data.error);
+                
+                status.textContent = `✅ Successfully added: ${data.title}`;
+                status.classList.replace('text-gray-400', 'text-green-400');
+                urlInput.value = '';
+                loadSongs(); // Refresh list
+            } catch (err) {
+                status.textContent = `❌ Error: ${err.message}`;
+                status.classList.replace('text-gray-400', 'text-red-400');
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('opacity-50', 'cursor-not-allowed');
+                setTimeout(() => {
+                    status.classList.add('hidden');
+                    status.className = 'mt-4 text-sm text-gray-400';
+                }, 5000);
+            }
+        }
+
+        async function deleteSong(id) {
+            if (!confirm('Are you sure you want to delete this song? The file will be removed from storage.')) return;
+            
+            try {
+                await fetch(`/api/songs/${id}`, { method: 'DELETE' });
+                loadSongs();
+            } catch (err) {
+                alert('Failed to delete song');
+            }
+        }
+
+        // Load songs on initial page load
+        loadSongs();
+    </script>
+</body>
+</html>
