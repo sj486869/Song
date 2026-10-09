@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from supabase import Client, create_client
 
-# Load variables from .env (only used locally; Render uses its own Environment Variables)
 load_dotenv()
 
 app = Flask(__name__)
@@ -21,10 +20,9 @@ BUCKET_NAME = "songs"
 TABLE_NAME = "songs"
 
 # Optional YouTube settings
-# Render "Secret Files" are mounted at /etc/secrets/<filename>
 COOKIES_SRC = os.getenv("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
-PROXY = os.getenv("YT_PROXY")  # e.g. http://user:pass@host:port
-MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))  # 20 min default
+PROXY = os.getenv("YT_PROXY")
+MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
 DOWNLOAD_DIR = "temp_downloads"
 
 CONTENT_TYPES = {
@@ -36,13 +34,20 @@ CONTENT_TYPES = {
     "mp3": "audio/mpeg",
 }
 
-# Initialize Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── Startup info ──────────────────────────────────────────────
+print(f"yt-dlp version: {yt_dlp.version.__version__}")
+print(f"Cookies file:   {COOKIES_SRC} → exists={os.path.exists(COOKIES_SRC)}")
+if os.path.exists(COOKIES_SRC):
+    with open(COOKIES_SRC) as f:
+        lines = [l for l in f.read().splitlines() if l and not l.startswith("#")]
+        print(f"Cookies loaded:  {len(lines)} entries")
+# ──────────────────────────────────────────────────────────────
 
 
 def build_ydl_opts(timestamp):
     opts = {
-        # Prefer m4a (no ffmpeg conversion needed), fall back to any best audio
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s"),
         "noplaylist": True,
@@ -50,21 +55,44 @@ def build_ydl_opts(timestamp):
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 3,
+        # Helps with bot detection on some versions
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
     }
     if PROXY:
         opts["proxy"] = PROXY
     if os.path.exists(COOKIES_SRC):
-        # yt-dlp may rewrite the cookie file, and Secret Files are read-only,
-        # so give it a writable copy.
         cookie_copy = os.path.join(DOWNLOAD_DIR, f"{timestamp}_cookies.txt")
         shutil.copy(COOKIES_SRC, cookie_copy)
         opts["cookiefile"] = cookie_copy
+        print(f"Using cookies from: {cookie_copy}")
+    else:
+        print("WARNING: No cookies file found — YouTube will likely block you")
     return opts
 
 
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+# ── Debug endpoint ────────────────────────────────────────────
+@app.route("/api/debug")
+def debug_info():
+    cookies_exist = os.path.exists(COOKIES_SRC)
+    cookie_count = 0
+    if cookies_exist:
+        with open(COOKIES_SRC) as f:
+            cookie_count = len(
+                [l for l in f.read().splitlines() if l and not l.startswith("#")]
+            )
+    return jsonify({
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "cookies_file": COOKIES_SRC,
+        "cookies_exist": cookies_exist,
+        "cookie_count": cookie_count,
+        "proxy": PROXY or "not set",
+    })
+# ──────────────────────────────────────────────────────────────
 
 
 @app.route("/api/songs", methods=["GET"])
@@ -87,16 +115,40 @@ def add_song():
     timestamp = int(time.time() * 1000)
 
     try:
-        with yt_dlp.YoutubeDL(build_ydl_opts(timestamp)) as ydl:
-            # Fetch metadata first so we can reject overly long videos
-            info = ydl.extract_info(url, download=False)
-            duration = info.get("duration")
-            if duration and duration > MAX_DURATION:
-                return jsonify(
-                    {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
-                ), 400
+        opts = build_ydl_opts(timestamp)
 
-            info = ydl.process_ie_result(info, download=True)
+        # First attempt
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                duration = info.get("duration")
+                if duration and duration > MAX_DURATION:
+                    return jsonify(
+                        {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
+                    ), 400
+                info = ydl.process_ie_result(info, download=True)
+        except yt_dlp.utils.DownloadError as first_err:
+            print(f"First attempt failed: {first_err}")
+
+            # Retry with verbose logging so we can see what's wrong
+            opts["verbose"] = True
+            opts["print"] = "debug"
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    duration = info.get("duration")
+                    if duration and duration > MAX_DURATION:
+                        return jsonify(
+                            {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
+                        ), 400
+                    info = ydl.process_ie_result(info, download=True)
+            except Exception as retry_err:
+                return jsonify({
+                    "error": f"Download failed after retry: {retry_err}",
+                    "first_error": str(first_err),
+                    "yt_dlp_version": yt_dlp.version.__version__,
+                    "cookies_found": os.path.exists(COOKIES_SRC),
+                }), 502
 
         title = info.get("track") or info.get("title") or "Unknown title"
         artist = (
@@ -151,7 +203,7 @@ def add_song():
                         cover_storage_path
                     )
             except requests.RequestException:
-                pass  # cover art is optional
+                pass
 
         # 3. Insert database record
         supabase.table(TABLE_NAME).insert(
@@ -166,12 +218,15 @@ def add_song():
         return jsonify({"message": "Success", "title": title, "artist": artist})
 
     except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"Download failed: {e}"}), 502
+        return jsonify({
+            "error": f"Download failed: {e}",
+            "yt_dlp_version": yt_dlp.version.__version__,
+            "cookies_found": os.path.exists(COOKIES_SRC),
+        }), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # Remove the audio, partial files and cookie copy for this request
         for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"{timestamp}*")):
             try:
                 os.remove(p)
@@ -182,7 +237,6 @@ def add_song():
 @app.route("/api/songs/<int:song_id>", methods=["DELETE"])
 def delete_song(song_id):
     try:
-        # Get URLs to delete files from Storage
         response = (
             supabase.table(TABLE_NAME)
             .select("audioUrl, coverUrl")
@@ -193,16 +247,12 @@ def delete_song(song_id):
             return jsonify({"error": "Song not found"}), 404
 
         song = response.data[0]
-
-        # Delete row from database
         supabase.table(TABLE_NAME).delete().eq("id", song_id).execute()
 
-        # Delete audio from storage
         if song.get("audioUrl") and f"/public/{BUCKET_NAME}/" in song["audioUrl"]:
             audio_path = song["audioUrl"].split(f"/public/{BUCKET_NAME}/")[-1]
             supabase.storage.from_(BUCKET_NAME).remove([audio_path])
 
-        # Delete cover from storage
         if song.get("coverUrl") and f"/public/{BUCKET_NAME}/" in song["coverUrl"]:
             cover_path = song["coverUrl"].split(f"/public/{BUCKET_NAME}/")[-1]
             supabase.storage.from_(BUCKET_NAME).remove([cover_path])
@@ -213,7 +263,6 @@ def delete_song(song_id):
 
 
 if __name__ == "__main__":
-    # Local development only; on Render gunicorn runs the app (see Dockerfile)
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", 5000)),
