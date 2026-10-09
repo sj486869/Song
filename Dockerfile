@@ -1,19 +1,19 @@
-FROM python:3.9-slim
+# 1. Update to Python 3.11 to fix the deprecation warning
+FROM python:3.11-slim
 
-# FFmpeg install karna zaroori hai yt-dlp ke liye
+# 2. Install FFmpeg
 RUN apt-get update && apt-get install -y ffmpeg
 
-# Working directory set karein
+# 3. Set Working Directory
 WORKDIR /app
 
-# Saare files ko container me copy karein
+# 4. Copy Files
 COPY . .
 
-# Python libraries install karein
+# 5. Install Libraries
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Port expose karein
 EXPOSE 5000
 
-# Gunicorn ke through Flask app ko run karein
-CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
+# 6. FIX: Add --timeout 120 to give yt-dlp enough time to download and convert the song
+CMD ["gunicorn", "--timeout", "120", "-b", "0.0.0.0:5000", "app:app"]
