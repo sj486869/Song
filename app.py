@@ -13,13 +13,11 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Supabase credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 BUCKET_NAME = "songs"
 TABLE_NAME = "songs"
 
-# Optional YouTube settings
 COOKIES_SRC = os.getenv("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
 PROXY = os.getenv("YT_PROXY")
 MAX_DURATION = int(os.getenv("MAX_DURATION_SECONDS", "1200"))
@@ -37,16 +35,23 @@ CONTENT_TYPES = {
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Startup info ──────────────────────────────────────────────
-print(f"yt-dlp version: {yt_dlp.version.__version__}")
-print(f"Cookies file:   {COOKIES_SRC} → exists={os.path.exists(COOKIES_SRC)}")
+print(f"yt-dlp version : {yt_dlp.version.__version__}")
+print(f"Cookies file   : {COOKIES_SRC}")
+print(f"Cookies exist  : {os.path.exists(COOKIES_SRC)}")
 if os.path.exists(COOKIES_SRC):
     with open(COOKIES_SRC) as f:
         lines = [l for l in f.read().splitlines() if l and not l.startswith("#")]
-        print(f"Cookies loaded:  {len(lines)} entries")
+        print(f"Cookies loaded : {len(lines)} entries")
 # ──────────────────────────────────────────────────────────────
 
 
-def build_ydl_opts(timestamp):
+def build_ydl_opts(timestamp, player_client="ios", use_cookies=False):
+    """Build yt-dlp options.
+
+    Strategy:
+      1. ios client  – works from datacenters, no cookies needed
+      2. web client  + cookies – fallback if ios stops working
+    """
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"{timestamp}.%(ext)s"),
@@ -55,18 +60,17 @@ def build_ydl_opts(timestamp):
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 3,
-        # Helps with bot detection on some versions
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
+        "extractor_args": {"youtube": {"player_client": [player_client]}},
     }
     if PROXY:
         opts["proxy"] = PROXY
-    if os.path.exists(COOKIES_SRC):
+    if use_cookies and os.path.exists(COOKIES_SRC):
         cookie_copy = os.path.join(DOWNLOAD_DIR, f"{timestamp}_cookies.txt")
         shutil.copy(COOKIES_SRC, cookie_copy)
         opts["cookiefile"] = cookie_copy
-        print(f"Using cookies from: {cookie_copy}")
+        print(f"[{player_client}] Using cookies")
     else:
-        print("WARNING: No cookies file found — YouTube will likely block you")
+        print(f"[{player_client}] No cookies")
     return opts
 
 
@@ -111,29 +115,29 @@ def add_song():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(DOWNLOAD_DIR, exist_ok$)
     timestamp = int(time.time() * 1000)
 
     try:
-        opts = build_ydl_opts(timestamp)
+        # ── Try multiple strategies ───────────────────────────
+        info = None
+        last_error = None
 
-        # First attempt
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                duration = info.get("duration")
-                if duration and duration > MAX_DURATION:
-                    return jsonify(
-                        {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
-                    ), 400
-                info = ydl.process_ie_result(info, download=True)
-        except yt_dlp.utils.DownloadError as first_err:
-            print(f"First attempt failed: {first_err}")
+        strategies = [
+            {"player_client": "ios",  "use_cookies": False, "label": "ios (no cookies)"},
+            {"player_client": "tv",   "use_cookies": False, "label": "tv (no cookies)"},
+            {"player_client": "web",  "use_cookies": True,  "label": "web + cookies"},
+            {"player_client": "mweb", "use_cookies": False, "label": "mweb (no cookies)"},
+        ]
 
-            # Retry with verbose logging so we can see what's wrong
-            opts["verbose"] = True
-            opts["print"] = "debug"
+        for strat in strategies:
+            print(f"Trying: {strat['label']}")
             try:
+                opts = build_ydl_opts(
+                    timestamp,
+                    player_client=strat["player_client"],
+                    use_cookies=strat["use_cookies"],
+                )
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     duration = info.get("duration")
@@ -142,14 +146,21 @@ def add_song():
                             {"error": f"Video too long (max {MAX_DURATION // 60} minutes)"}
                         ), 400
                     info = ydl.process_ie_result(info, download=True)
-            except Exception as retry_err:
-                return jsonify({
-                    "error": f"Download failed after retry: {retry_err}",
-                    "first_error": str(first_err),
-                    "yt_dlp_version": yt_dlp.version.__version__,
-                    "cookies_found": os.path.exists(COOKIES_SRC),
-                }), 502
+                print(f"Success with: {strat['label']}")
+                break  # worked!
+            except Exception as e:
+                last_error = e
+                print(f"Failed with {strat['label']}: {e}")
+                continue
 
+        if info is None:
+            return jsonify({
+                "error": f"All download strategies failed. Last error: {last_error}",
+                "yt_dlp_version": yt_dlp.version.__version__,
+                "cookies_found": os.path.exists(COOKIES_SRC),
+            }), 502
+
+        # ── Process result ────────────────────────────────────
         title = info.get("track") or info.get("title") or "Unknown title"
         artist = (
             info.get("artist")
@@ -217,12 +228,6 @@ def add_song():
 
         return jsonify({"message": "Success", "title": title, "artist": artist})
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({
-            "error": f"Download failed: {e}",
-            "yt_dlp_version": yt_dlp.version.__version__,
-            "cookies_found": os.path.exists(COOKIES_SRC),
-        }), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
