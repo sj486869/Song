@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && apt-get install -y --no-install-recommends ffmpeg curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno (yt-dlp needs it for YouTube)
