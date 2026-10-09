@@ -1,5 +1,5 @@
 flask
-yt-dlp
+git+https://github.com/yt-dlp/yt-dlp.git@master
 supabase
 python-dotenv
 requests
